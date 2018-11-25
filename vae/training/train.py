@@ -1,24 +1,20 @@
 import argparse
 import torch
-import torch.utils.data
-from torch import nn, optim
-from torch.autograd import Variable
+import torch.optim as optim
 import torch.nn as nn
 from torch.nn import functional as F
-from torchvision import datasets, transforms
-from torchvision.utils import save_image
 from torch.utils.data import TensorDataset
 import numpy as np
-from sklearn.model_selection import ShuffleSplit
-import segypy 
 
 from asap.model import VAE
+from asap.data import load_dataset as load_dataset
+
 import os
 
 parser = argparse.ArgumentParser(description='AutoEncoder')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=100, metavar='N',
+parser.add_argument('--epochs', type=int, default=5, metavar='N',
                     help='number of epochs to train (default: 10)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
@@ -58,56 +54,6 @@ if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
 
-def load_dataset(near_stack_fname, far_stack_fname):
-    near_stack = np.load(near_stack_fname)
-    far_stack = np.load(far_stack_fname)
-
-    traces = np.stack([near_stack, far_stack], 1)
-    traces = np.swapaxes(traces, axis1=1, axis2=2)
-    traces = np.swapaxes(traces, axis1=0, axis2=3)
-
-    #use all the even inlines and crosslines for training, all odd for test
-    training_traces = traces[::2, ::2]
-    test_traces = traces[1::2, 1::2]
-
-    def get_windows(trace, window_length):
-        windows = []
-        for i in range(window_length, trace.shape[1]-window_length):
-            windows.append(trace[:, i:i+window_length])
-        return np.array(windows)
-
-    windowed_training = np.array([get_windows(tr, args.window_size) for tr in training_traces.reshape(-1, training_traces.shape[2], training_traces.shape[3])])
-    windowed_test = np.array([get_windows(tr, args.window_size) for tr in test_traces.reshape(-1, test_traces.shape[2], test_traces.shape[3])])
-    windowed_all = np.array([get_windows(tr, args.window_size) for tr in traces.reshape(-1, traces.shape[2], traces.shape[3])])
-
-    windowed_training = windowed_training.reshape(-1, windowed_training.shape[2], windowed_training.shape[3])
-    windowed_test = windowed_test.reshape(-1, windowed_test.shape[2], windowed_test.shape[3])
-    windowed_all = windowed_all.reshape(-1, windowed_all.shape[2], windowed_all.shape[3])
-
-
-    #Normalise the data to the training data mean and std-dev
-    for i in range(2):
-        windowed_training[:, i] -= np.mean(training_traces[:, :, i])
-        windowed_training[:, i] /= np.std(training_traces[:, :, i])
-        windowed_test[:, i] -= np.mean(training_traces[:, :, i])
-        windowed_test[:, i] /= np.std(training_traces[:, :, i])
-        windowed_all[:, i] -= np.mean(training_traces[:, :, i])
-        windowed_all[:, i] /= np.std(training_traces[:, :, i])
-
-
-    #convert everything to torch
-    X_train = torch.from_numpy(windowed_training).float()
-    y_train = torch.from_numpy(np.zeros((X_train.shape[0], 1))).float()
-
-    X_test = torch.from_numpy(windowed_test).float()
-    y_test = torch.from_numpy(np.zeros((X_test.shape[0], 1))).float()
-
-    X_all = torch.from_numpy(windowed_all).float()
-    y_all = torch.from_numpy(np.zeros((X_all.shape[0], 1))).float()
-
-    return X_train, y_train, X_test, y_test, X_all, y_all
-
-
 def process_whole_dataset(model, loader):
     model.eval()
     batches = []
@@ -133,7 +79,7 @@ def process_whole_dataset(model, loader):
 
 near_stack_fname, far_stack_fname = os.path.expandvars(args.fname_near_stack), os.path.expandvars(args.fname_far_stack)
 
-X_train, y_train, X_test, y_test, _, _ = load_dataset(near_stack_fname, far_stack_fname)
+X_train, y_train, X_test, y_test, _, _ = load_dataset(near_stack_fname, far_stack_fname, args.window_size)
 
 train_dset = TensorDataset(X_train, y_train)
 test_dset = TensorDataset(X_test, y_test)
@@ -144,12 +90,13 @@ train_loader = torch.utils.data.DataLoader(train_dset,
 test_loader = torch.utils.data.DataLoader(test_dset,
     batch_size=args.batch_size, shuffle=False, **kwargs)
 
-model = VAE(args)
+model = VAE()
 if args.cuda:
     model.cuda()
 optimizer = optim.RMSprop(model.parameters(), lr=1e-3)
 
 criterion_mse = nn.MSELoss(size_average=False)
+
 # Reconstruction + KL divergence losses summed over all elements and batch
 def loss_function(recon_x, x, mu, logvar):
     BCE = criterion_mse(recon_x.view(-1, 2, args.window_size), x.view(-1, 2, args.window_size))
@@ -167,24 +114,25 @@ def train(epoch):
     model.train()
     train_loss = 0
     for batch_idx, (data, _) in enumerate(train_loader):
-        data = Variable(data)
+        data.requires_grad = True
         if args.cuda:
             data = data.cuda()
         optimizer.zero_grad()
+        print(data.size())
         recon_batch, mu, logvar, _ = model(data)
         loss = loss_function(recon_batch, data, mu, logvar)
         loss.backward()
-        train_loss += loss.data[0]
+        train_loss += loss.item()
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader),
-                loss.data[0] / len(data)))
+                loss.item() / len(data)))
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
-    return train_loss
+    return train_loss/len(train_loader.dataset)
 
 
 def test(epoch):
@@ -194,32 +142,24 @@ def test(epoch):
         for i, (data, _) in enumerate(test_loader):
                 if args.cuda:
                     data = data.cuda()
-                data = Variable(data, volatile=True)
                 recon_batch, mu, logvar, _ = model(data)
-                test_loss += loss_function(recon_batch, data, mu, logvar).data[0]
+                test_loss += loss_function(recon_batch, data, mu, logvar).item()
                 if epoch == args.epochs and i == 0:
                     n = min(data.size(0), 8)
 
         test_loss /= len(test_loader.dataset)
         np.save(os.path.expandvars(args.out_dir)+"/test_out_"+str(epoch)+".npy", np.array([data.cpu().numpy(), recon_batch.cpu().numpy()]))
         print('====> Test set loss: {:.4f}'.format(test_loss))
-    return test_loss
+    return test_loss/len(test_loader.dataset)
 
 losses = []
 for epoch in range(1, args.epochs + 1):
-    tl = train(epoch)
+    trainl = train(epoch)
     testl = test(epoch)
-    if epoch == args.epochs:
-        sample = Variable(torch.randn(64, args.hidden_size))
-        if args.cuda:
-            sample = sample.cuda()
-        sample = model.decode(sample).cpu()
-
-    losses.append([tl, testl])
-    if epoch % 2 == 0:
+    losses.append([trainl, testl])
+    if epoch % 1 == 0:
+        print("saving")
         torch.save(model.state_dict(), os.path.expandvars(args.out_dir)+"/model_epoch_"+str(epoch)+".pth")
-        #all_out(epoch)
-
 
 np.save(os.path.expandvars(args.out_dir)+"/losses.npy", np.array(losses))
 
